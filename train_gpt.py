@@ -1072,8 +1072,10 @@ class CausalSelfAttention(nn.Module):
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor, attn_args: AttnArgs, qkvo_w: Tensor):
-        B, T = x.size(0), x.size(1) # batch size, sequence length
+    def forward(self, x, attn_args: AttnArgs, qkvo_w: Tensor):
+        # x is a tuple (xq, xk, xv, x_gate): separate Q/K/V inputs + gate signal
+        xq, xk, xv, x_gate = x
+        B, T = xq.size(0), xq.size(1)
         assert B == 1, "varlen sequences requires B == 1"
         assert T % 16 == 0
         # unpack attention args
@@ -1085,7 +1087,10 @@ class CausalSelfAttention(nn.Module):
         attn_gate_w, ve_gate_w = attn_args.attn_gate_w, attn_args.ve_gate_w
         train_max_seq_len = attn_args.train_max_seq_len
 
-        q, k, v = F.linear(x, sa_lambdas[0] * qkvo_w[:self.dim * 3].type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
+        scale = sa_lambdas[0]
+        q = F.linear(xq, scale * qkvo_w[:self.dim].type_as(xq)).view(B, T, self.num_heads, self.head_dim)
+        k = F.linear(xk, scale * qkvo_w[self.dim:2*self.dim].type_as(xk)).view(B, T, self.num_heads, self.head_dim)
+        v = F.linear(xv, scale * qkvo_w[2*self.dim:3*self.dim].type_as(xv)).view(B, T, self.num_heads, self.head_dim)
         max_len = train_max_seq_len if self.training else (args.val_batch_size // (grad_accum_steps * world_size))
 
         q, k = norm(q), norm(k) # QK norm @Grad62304977
@@ -1099,7 +1104,7 @@ class CausalSelfAttention(nn.Module):
 
             if ve is not None:
                 # gate pattern g(x[:6] + ve[:6]) by @photomz
-                ve_gate_out = 2 * torch.sigmoid(F.linear(torch.cat([x[..., :6], ve[None, ..., :6]], dim=-1), ve_gate_w)).view(B, T, self.num_heads, 1)
+                ve_gate_out = 2 * torch.sigmoid(F.linear(torch.cat([x_gate[..., :6], ve[None, ..., :6]], dim=-1), ve_gate_w)).view(B, T, self.num_heads, 1)
                 v = v + ve_gate_out * ve.view_as(v) # @ KoszarskyB & @Grad62304977
 
         else:
@@ -1117,7 +1122,7 @@ class CausalSelfAttention(nn.Module):
             k = k.view(B, T * 2, self.num_heads // 2, self.head_dim)
 
             if ve is not None:
-                ve_gate_out = 2 * torch.sigmoid(F.linear(x[..., :12], ve_gate_w)).view(B, T * 2, self.num_heads // 2, 1)
+                ve_gate_out = 2 * torch.sigmoid(F.linear(x_gate[..., :12], ve_gate_w)).view(B, T * 2, self.num_heads // 2, 1)
                 v = v + ve_gate_out * ve.view_as(v)
 
             seqlens = 2 * seqlens
@@ -1128,7 +1133,7 @@ class CausalSelfAttention(nn.Module):
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
         y = y.view(B, T, self.num_heads, self.head_dim)
-        y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
+        y = y * torch.sigmoid(F.linear(x_gate[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
         y = F.linear(y, sa_lambdas[1] * qkvo_w[self.dim * 3:].type_as(y))  # sa_lambdas[1] pre-multiplied to O @shenberg
         return y
@@ -1231,6 +1236,22 @@ class GPT(nn.Module):
         # sqrt(1.1) per sublayer so cumulative per-layer scaling is 1.1
         self.resid_lambdas = nn.Parameter(torch.full((num_layers, 2), 1.1**0.5))
 
+        # Cross-layer dynamic dense combination (MUDDFormer QKVM-style)
+        # C=4 channels: Q input, K input, V input, Residual for next layer
+        self.C = 4
+        max_L = num_layers + 1
+        dw_shape = (self.C, max_L)
+        initer_dim = (np.prod(dw_shape) // 64 + 1) * 64
+        self.dense_w1 = nn.Parameter(torch.empty(num_layers, initer_dim, model_dim))
+        for i in range(num_layers):
+            nn.init.kaiming_uniform_(self.dense_w1.data[i], a=math.sqrt(5))
+        self.dense_w2 = nn.Parameter(torch.zeros(num_layers, initer_dim, *dw_shape))
+        dense_bs = torch.zeros(num_layers, self.C, max_L)
+        for i in range(num_layers):
+            dense_bs[i, :, i + 1] = 1.0
+        self.dense_bs = nn.Parameter(dense_bs)
+        print0(f'dense_w1 shape: {self.dense_w1.shape}, dense_w2 shape: {self.dense_w2.shape}, dense_bs: {self.dense_bs}')
+
         pad = (-num_layers * 2 - 3) % dist.get_world_size()
         self.scalars = nn.Parameter(
             torch.cat(
@@ -1306,8 +1327,11 @@ class GPT(nn.Module):
         skip_gate_out = torch.sigmoid(skip_lambda) * 2 * torch.sigmoid(self.skip_gate(x0[..., :self.skip_gate.weight.size(-1)]))
         
         # ---- Transformer layers ----
+        hiddens = [x]
+        xs = [x, x, x, x]  # (mudd_q, mudd_k, mudd_v, mudd_res) from previous layer's MUDD
         x_backout = None
         skip_connection = None
+        C = self.C
         for i in range(self.num_layers):
             yarn = self.yarn_paired_head if i in self.paired_head_layers else self.yarn
             attn_args = AttnArgs(
@@ -1331,16 +1355,39 @@ class GPT(nn.Module):
 
             # Skip attention on layer 6 @YouJiacheng. Instead pull skip connection from prior long window
             if i == 6:
-                x = x + skip_gate_out * skip_connection
+                x_res = xs[3]
+                x = x_res + skip_gate_out * skip_connection
             else:
-                attn_in = x_backout if x_backout is not None else x
-                attn_out = attn(norm(attn_in), attn_args, qkvo_w)
+                x = xs[3]
+                normed_qkvx = [norm(x) for x in xs]
+                attn_out = attn(normed_qkvx, attn_args, qkvo_w)
                 x = resid_lambdas_attn[i] * x + post_lambdas_attn[i] * attn_out + x0_inject[i]
             x = resid_lambdas_mlp[i] * x + post_lambdas_mlp[i] * ReLUSqrdMLP(norm(x), c_fc, c_proj)
+           
+            # Cross-layer dynamic dense combination (4-channel QKVM)
+            hiddens.append(x)
+            _hidden = torch.stack(hiddens) # LBTD
+            L = i + 2
+            CL = C * L
+            dense_w1_out = F.linear(norm(x), self.dense_w1[i]) # BTD -> BTd
+            dense_w1_out_act = F.gelu(dense_w1_out)
+            dense_w2_out = torch.einsum('BTd, dCL -> BTCL', dense_w1_out_act, self.dense_w2[i, :, :, :L])
+            dw = dense_w2_out + self.dense_bs[i, :, :L][None,None,:,:] # BTCL + CL -> BTCL
+
+            dw = F.softmax(dense_w2_out + self.dense_bs[i, :, :L][None,None,:,:], dim=-1)
+            xs = tuple(
+                torch.einsum('LBTD, BTL -> BTD', _hidden, dw[:, :, c, :])
+                for c in range(C)
+            )
+
             if i == 3:
-                skip_connection = x
+                skip_connection = xs[3]
             if i == 7:
-                x_backout = x
+                x_backout = xs[3]
+
+            x = xs
+
+        x = xs[3]
 
         # back out contributions from first 7 layers
         x -= backout_lambda * x_backout
@@ -1691,12 +1738,16 @@ class TrainingManager():
             "resid_lambdas":  {"optim": "adam",    "comms": "replicated",     "adam_betas": [0.9,  0.95], "lr_mul": 5.0,  "wd_mul": 0.0},
             "value_embeds":   {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.75, 0.95], "lr_mul": 75.,  "wd_mul": 5.0},
             "embed":          {"optim": "adam",    "comms": "sharded",    "adam_betas": [0.5,  0.95], "wd_mul": 150.},
+            "dense_w1":       {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "dense_w2":       {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
+            "dense_bs":       {"optim": "adam",    "comms": "replicated", "adam_betas": [0.9,  0.95], "lr_mul": 1.0,  "wd_mul": 0.0},
         }
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
             "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
+            "dense_w1", "dense_w2", "dense_bs",  # Cross-layer dynamic dense (small, replicated)
             "value_embeds", "bigram_embed",  # Medium
             "lm_head", "embed",   # lm_head must complete before embed sync (when tied)
             "attn_bank", "mlp_bank",  # Large, polar express - process last to maximize overlap
@@ -1884,6 +1935,9 @@ model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
 model.attn_bank.data = model.attn_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
+model.dense_w1.data = model.dense_w1.data.bfloat16()
+model.dense_w2.data = model.dense_w2.data.bfloat16()
+model.dense_bs.data = model.dense_bs.data.bfloat16()
 for param in model.parameters():
     dist.broadcast(param.detach(), 0)
 
@@ -1904,6 +1958,8 @@ val_loader = distributed_data_generator(args.val_files, args.val_batch_size, -1,
 transition_steps = training_manager.get_transition_steps()
 # first and last pair of steps in each transition
 warmup_steps = sorted({0, 1 } | set(s + offset for s in transition_steps for offset in [-2, -1, 0, 1] if s + offset >= 0))
+import time
+compile_start_time = time.time()
 print0(f"Sampling steps {warmup_steps} for warmup", console=True)
 for step in warmup_steps:
     training_manager.advance_schedule(step)
@@ -1922,6 +1978,9 @@ for step in warmup_steps:
         del loss
     training_manager.step_optimizers(step)
 print0("Resetting Model", console=True)
+compile_time = time.time() - compile_start_time
+print0(f'Compile time: {compile_time:.2f}s', console=True)
+
 model.zero_grad(set_to_none=True)
 model.load_state_dict(initial_state["model"])
 training_manager.reset(initial_state["optimizer"])
