@@ -7,6 +7,10 @@ with open(sys.argv[0], 'r') as f:
 with open(os.path.join(os.path.dirname(sys.argv[0]), 'triton_kernels.py'), 'r') as f:
     code += f"\n\n{'-'*40}\n# triton_kernels.py\n{'-'*40}\n\n"
     code += f.read()
+with open(os.path.join(os.path.dirname(sys.argv[0]), 'dc_triton_kernels.py'), 'r') as f:
+    code += f"\n\n{'-'*40}\n# dc_triton_kernels.py\n{'-'*40}\n\n"
+    code += f.read()
+
 
 import copy
 import glob
@@ -36,6 +40,9 @@ from kernels import get_kernel
 from torch import Tensor, nn
 
 from triton_kernels import XXT, XTX, ba_plus_cAA, FusedLinearReLUSquareFunction, FusedSoftcappedCrossEntropy, transpose_add, transpose_copy
+from dc_triton_kernels import (
+    dc_attention_postonly_nodd_correction_add_base_triton,
+)
 # Fused triton kernel: relu(x @ W1.T)^2 @ W2.T
 # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
 ReLUSqrdMLP = FusedLinearReLUSquareFunction.apply
@@ -1065,6 +1072,19 @@ class AttnArgs:
 
 flash_attn_interface = get_kernel('varunneal/flash-attention-3').flash_attn_interface
 
+
+def dc_gate(
+    x: Tensor,
+    dc_w: tuple[Tensor, Tensor],
+    num_heads: int,
+) -> tuple[Tensor, Tensor]:
+    dc_w1, dc_w2 = dc_w
+    hidden = F.gelu(F.linear(x, dc_w1.type_as(x)), approximate="tanh")
+    raw_w = F.linear(hidden, dc_w2.type_as(hidden)).view(x.size(0), x.size(1), 2, num_heads)
+    post_w1, post_w2 = raw_w.unbind(dim=2)
+    post_w1 = F.rms_norm(post_w1.float(), (num_heads,), eps=1.0e-6).type_as(post_w1)
+    return post_w1, post_w2
+
 class CausalSelfAttention(nn.Module):
     def __init__(self, dim: int, head_dim: int, num_heads: int, paired: bool = False):
         super().__init__()
@@ -1076,7 +1096,7 @@ class CausalSelfAttention(nn.Module):
         assert self.hdim == self.dim, "num_heads * head_dim must equal model_dim"
         # Weights are stored in parameter banks and passed via forward()
 
-    def forward(self, x: Tensor|tuple[Tensor, Tensor], attn_args: AttnArgs, qkvo_w: Tensor):
+    def forward(self, x: Tensor|tuple[Tensor, Tensor], attn_args: AttnArgs, qkvo_w: Tensor, dc_w: tuple[Tensor, Tensor] | None = None,):
         # MUDD v-only add mode: x is a tuple (x_residual, v_mudd) where v_mudd (B, T, H, D_head)
         # is added to the baseline V derived from x_residual (saves a per-channel matmul).
         is_mudd = isinstance(x, tuple)
@@ -1142,6 +1162,15 @@ class CausalSelfAttention(nn.Module):
         y = flash_attn_interface.flash_attn_varlen_func(q[0], k[0], v[0], cu_seqlens_q=seqlens, cu_seqlens_k=seqlens,
                                                         max_seqlen_q=max_len, max_seqlen_k=max_len,
                                                         causal=True, softmax_scale=yarn.attn_scale, window_size=(bm_size, 0))
+
+        if dc_w is not None:
+            dc_weights = dc_gate(x, dc_w, self.num_heads)
+            y = dc_attention_postonly_nodd_correction_add_base_triton(
+                y, q, k, v, dc_weights, None,
+                scaling=yarn.attn_scale,
+                window=112, # dc window is fixed to 112,
+                seq_lens=seqlens,
+            )
         y = y.view(B, T, self.num_heads, self.head_dim)
         y = y * torch.sigmoid(F.linear(x[..., :12], attn_gate_w)).view(B, T, self.num_heads, 1)
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
@@ -1182,6 +1211,9 @@ class GPT(nn.Module):
         # parameter banks for attention and value embedding gate weights
         self.attn_gate_bank = nn.Parameter(torch.zeros(10, num_heads, 12)) # 10 layers
         self.ve_gate_bank = nn.Parameter(torch.zeros(5, num_heads, 12)) # 5 unique gates
+        dc_hidden_dim = num_heads * 2
+        self.dc_w1_bank = nn.Parameter(torch.empty(num_layers - 1, dc_hidden_dim, model_dim))
+        self.dc_w2_bank = nn.Parameter(torch.empty(num_layers - 1, 2 * num_heads, dc_hidden_dim))
         self.gate_filler_nones = [None] * (num_layers - 6)
 
         # -----------------------------------
@@ -1226,7 +1258,12 @@ class GPT(nn.Module):
             self.vo_bank[num_vo_real:].zero_()
             self.mlp_bank[:, 0, :, :].uniform_(-bound, bound)  # c_fc
             self.mlp_bank[:, 1, :, :].zero_()  # c_proj - zero init suggested by @Grad62304977
-
+            dc_w1_std = math.sqrt(2.0 / (model_dim + dc_hidden_dim))
+            dc_w2_init = math.sqrt(1.0 / dc_hidden_dim) * 2.0 / (num_heads + 2.0) * 0.01
+            self.dc_w1_bank.normal_(0.0, dc_w1_std)
+            self.dc_w2_bank.zero_()
+            self.dc_w2_bank[:, :num_heads, :dc_hidden_dim].normal_(0.0, dc_w2_init)
+           
         # Attention modules (no learned params -- weights come from qk_bank/vo_bank)
         self.paired_head_layers = [0, 2, 5, 9]
         self.attn = CausalSelfAttention(model_dim, head_dim, num_heads, paired=False)
@@ -1272,6 +1309,7 @@ class GPT(nn.Module):
             )
         )
         self._init_mudd(num_layers, model_dim)
+        self.dc_layers = [10]
 
         # Auto-label parameters
         for name, param in self.named_parameters():
@@ -1375,6 +1413,10 @@ class GPT(nn.Module):
         veg = self.ve_gate_bank.unbind(0)
         attn_gates = [*ag[:6], None, *ag[6:]]
         ve_gates = [None, veg[0], veg[1], *self.gate_filler_nones, veg[2], veg[3], veg[4]]
+        dcw1 = self.dc_w1_bank.unbind(0)
+        dcw2 = self.dc_w2_bank.unbind(0)
+        dc_weights = [*(zip(dcw1[:6], dcw2[:6])), None, *(zip(dcw1[6:], dcw2[6:]))]
+        assert len(dc_weights) == self.num_layers
         assert len(attn_gates) == self.num_layers
         assert len(ve_gates) == self.num_layers
         qk_all = self.qk_bank[:self._num_qk_groups].view(self._num_attn_layers, -1, self.qk_bank.shape[-1])
@@ -1451,6 +1493,12 @@ class GPT(nn.Module):
             # Select weights from banks
             attn_idx = i - (i > 6) if i != 6 else None
             qkvo_w = attn_weights[attn_idx] if attn_idx is not None else None
+            use_dc_layer = (
+                attn_idx is not None
+                and i not in self.paired_head_layers
+                and i in [10] # only layer 10 uses dc
+            )
+            dc_w = dc_weights[i] if use_dc_layer else None
             c_fc = mlp_fcs[i]
             c_proj = mlp_projs[i]
 
@@ -1463,10 +1511,10 @@ class GPT(nn.Module):
             else:
                 attn_in = h7_snap if h7_snap is not None else x
                 if v_mudd is not None:
-                    attn_out = attn((norm(attn_in), v_mudd), attn_args, qkvo_w)
+                    attn_out = attn((norm(attn_in), v_mudd), attn_args, qkvo_w, dc_w)
                     v_mudd = None
                 else:
-                    attn_out = attn(norm(attn_in), attn_args, qkvo_w)
+                    attn_out = attn(norm(attn_in), attn_args, qkvo_w, dc_w)
                 if next_resid_attn_gate is not None:
                     x0_inj = next_x0_lambda_gate * x0 + next_bigram_lambda_gate * x0_bigram
                     x = next_resid_attn_gate * x + next_post_attn_gate * attn_out + x0_inj
@@ -1748,7 +1796,7 @@ class Hyperparameters:
     # batch sizes
     val_batch_size: int = 4 * 64 * 1024 * 8
     # schedule
-    num_scheduled_iterations: int = 1405  # number of steps to complete lr and ws schedule
+    num_scheduled_iterations: int = 1370  # number of steps to complete lr and ws schedule
     num_extension_iterations: int = 10  # number of steps to continue training at final lr and ws
     # evaluation and logging
     run_id: str = f"{uuid.uuid4()}"
@@ -1902,11 +1950,18 @@ class TrainingManager():
             "dense_w2":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25},
             "dense_bs":    {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": 0.25, "wd_mul": 0.0},
         })
+        dc_lr_mul = dc_w2_lr_mul = 0.25
+        self.param_table.update({
+            "dc_w1_bank": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": dc_lr_mul, "wd_mul": 0.0},
+            "dc_w2_bank": {"optim": "adam", "comms": "replicated", "adam_betas": [0.9, 0.99], "lr_mul": dc_w2_lr_mul, "wd_mul": 0.0},
+        })
+        dc_work_order = ["dc_w1_bank", "dc_w2_bank"]
+    
 
         # - Process smaller/faster params first while large reduces complete
         # - lm_head must complete before embed sync (when tied)
         self.work_order = [
-            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", "dense_bs", 
+            "scalars", "smear_gate", "skip_gate", "attn_gate_bank", "ve_gate_bank", *dc_work_order, "dense_bs", 
             "post_lambdas", "x0_lambdas", "bigram_lambdas", "resid_lambdas",  # Small, fast
         ] + [
             "dense_w2",
@@ -2096,6 +2151,8 @@ for m in model.modules():
         m.weight.data = m.weight.data.bfloat16()
 model.attn_gate_bank.data = model.attn_gate_bank.data.bfloat16()
 model.ve_gate_bank.data = model.ve_gate_bank.data.bfloat16()
+model.dc_w1_bank.data = model.dc_w1_bank.data.bfloat16()
+model.dc_w2_bank.data = model.dc_w2_bank.data.bfloat16()
 model.qk_bank.data = model.qk_bank.data.bfloat16()
 model.vo_bank.data = model.vo_bank.data.bfloat16()
 model.mlp_bank.data = model.mlp_bank.data.bfloat16()
